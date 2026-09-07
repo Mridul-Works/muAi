@@ -1,0 +1,274 @@
+================================================================================
+muAi — an AI app builder (Lovable clone)
+Overview and build notes
+================================================================================
+
+WHAT IT IS
+--------------------------------------------------------------------------------
+A chat interface where you describe an app in plain language and a coding agent
+builds it, file by file, into a live preview that updates as it works.
+
+Decisions locked in during planning:
+
+  Runtime for generated apps   Sandpack (in-browser bundler). No server
+                               sandboxes, no per-project containers, zero infra
+                               cost. Swappable later — see "Swapping the runtime".
+  Scope of generated apps      General purpose.
+  v1 deployment                Local, single user, your own API key.
+  Auth / database              None yet. Slice 2 adds SQLite.
+  Export                       GitHub push + ZIP. Not built yet (Slice 4).
+  Billing                      None. A loop guard protects the rate limit.
+  Long-term goal               A real product with users. The local build is
+                               stage one, not the end state.
+
+
+GETTING IT RUNNING
+--------------------------------------------------------------------------------
+1. A Gemini API key is already in .env.local (AI_PROVIDER=gemini).
+2. npm run dev   ->   http://localhost:3000
+
+To switch providers, change AI_PROVIDER. Presets live in
+src/lib/ai/provider.ts. Free-tier model names change often — if a request
+returns 404, set AI_MODEL rather than editing the presets table.
+
+
+PROVIDER REALITY — MEASURED 2026-09-01, GEMINI FREE TIER
+--------------------------------------------------------------------------------
+Findings from running the real API, not documentation:
+
+  gemini-2.5-flash        Rejected outright for new keys ("no longer available
+                          to new users") even though the models list shows it.
+  gemini-3.6-flash        Works, good quality — but free tier is 5 requests/min
+                          AND ~20 requests/DAY. One build burns the whole day.
+  gemini-3.5-flash-lite   Current default. Separate, larger quota; completed a
+                          full agentic build (8 tool rounds, deps added, app
+                          written) with zero rate-limit hits.
+
+Two Gemini 3.x protocol quirks the adapter now handles — do not remove:
+
+  thought_signature       Gemini attaches extra_content.google.thought_signature
+                          to each tool call and returns 400 on the next turn if
+                          it is not echoed back verbatim. Carried opaquely in
+                          ToolCall.extra through history and re-sent.
+  parallel calls, no index  Gemini emits parallel tool calls each with a
+                          distinct id and NO index field (OpenAI-style clients
+                          key fragments by index). Keying by array position
+                          concatenated two calls' arguments into invalid JSON.
+                          The ToolCallAccumulator resolves a stable key per
+                          call (id first, index-mapped for continuations).
+
+Rate limiting: 429s are retried with backoff (default 8 attempts) honoring
+Retry-After and Google's retryDelay hint, streaming a "notice" event so the UI
+shows "Rate limited, retrying in Ns" instead of hanging. Tune AI_MAX_RETRIES.
+
+
+ARCHITECTURE
+--------------------------------------------------------------------------------
+
+  Browser                              Server (Next route handler)
+  -------                              ---------------------------
+  Workbench.tsx                        POST /api/chat
+    holds messages + files               builds VirtualFS from posted files
+    POSTs both, reads SSE                runs the agent loop
+                                         streams events back
+  PreviewPanel.tsx
+    Sandpack, live-updated
+
+The server is stateless. The browser owns the project files and the
+conversation, and posts both with every message. That is what lets v1 skip a
+database entirely — and it means adding one later is purely additive.
+
+  src/lib/ai/          Provider abstraction
+    types.ts             ChatMessage, ToolCall, ToolSchema, ProviderEvent.
+                         Everything downstream speaks only these types.
+    openai-compatible.ts One adapter covering Gemini, Groq, OpenRouter,
+                         Cerebras, Mistral and OpenAI — they all speak the
+                         OpenAI chat-completions shape. Handles SSE parsing
+                         and accumulating tool-call fragments (which arrive
+                         split across frames, keyed by index).
+    provider.ts          Preset table + factory reading env vars.
+
+  src/lib/fs/
+    virtual-fs.ts        In-memory filesystem. Records every mutation so the
+                         loop can stream file changes to the browser as they
+                         happen.
+
+  src/lib/agent/
+    tools.ts             The 8 file tools and their executors. Strict arg
+                         validation: a missing or mistyped argument is a tool
+                         error the model sees, never a silent empty write.
+    prompt.ts            System prompt builder.
+    loop.ts              The agent loop. Handles finish_reason "length"
+                         (truncation) and refuses to commit empty turns.
+    events.ts            SSE wire protocol, shared by server and client.
+    history.ts           Request validation + history sanitizer: dangling
+                         tool_calls (user hit Stop mid-round, connection
+                         dropped) get synthesized "cancelled" results so a
+                         half-finished turn can never brick the session.
+
+  src/lib/env.ts         Env parsing that can't brick the app (NaN/0 guards).
+
+  src/lib/templates/
+    types.ts             Template interface.
+    react-classic.ts     The starter project + its prompt fragment.
+    index.ts             Template registry / default export.
+
+  src/components/
+    Workbench.tsx        State container: messages, files, streaming.
+    ChatPanel.tsx        Chat, activity log, composer.
+    PreviewPanel.tsx     Sandpack preview + code editor + file tree.
+
+
+THE AGENT LOOP
+--------------------------------------------------------------------------------
+Tools: list_files, read_file, write_file, edit_file, delete_file, rename_file,
+       search_files, add_dependency.
+
+Each iteration:
+  1. Rebuild the system prompt (file TREE only, never file contents).
+  2. Stream a completion. Emit text deltas; collect tool calls.
+  3. No tool calls -> the turn is finished.
+  4. Otherwise execute each tool against the VirtualFS, stream the resulting
+     file writes to the browser, append the results to history, loop.
+
+Two design choices worth preserving:
+
+  Tree, not contents. The system prompt lists paths and line counts only. The
+  model reads what it needs via read_file, and those reads land in the message
+  history as tool results. History therefore only ever grows at the end.
+
+  Append-only history. Nothing already in the conversation is ever rewritten.
+  That is what makes prefix caching work when you move to a paid provider — a
+  regenerated "here are all current files" block would invalidate the cache on
+  every single message and roughly double your bill.
+
+Loop guard: AGENT_MAX_ITERATIONS (default 25) caps tool rounds per message.
+This is not billing — it stops a model that gets stuck editing the same file in
+circles from draining your rate limit unattended.
+
+
+THE TEMPLATE IS THE QUALITY CEILING
+--------------------------------------------------------------------------------
+src/lib/templates/react-classic.ts holds two things that must always change
+together:
+
+  files            the starter project
+  promptFragment   the description of it injected into the system prompt
+
+A component that exists in files but is not described in promptFragment will
+never get used. Whatever is not described, the model invents — usually badly.
+
+The current template is deliberately thin, pending your design system. When it
+arrives, expanding these two fields is most of the work — no other file needs
+to change.
+
+Three constraints were established EMPIRICALLY (headless Chromium, 2026-09-02)
+— violating any of them silently breaks the preview:
+
+  1. Sandpack template must be "react-ts" (classic in-browser bundler,
+     renders in ~3s). The "vite-react-ts" template runs on Nodebox, a
+     Node-in-browser runtime, which failed to render within 120s and wedged
+     the page.
+  2. Sandpack MERGES the base template's files with ours — a base file we
+     don't override becomes a ghost the agent's VirtualFS can't see. So the
+     template uses the react-ts base layout and overrides every base file:
+     /index.tsx (entry), /App.tsx, /styles.css, /public/index.html,
+     /package.json, tsconfig.json. Components go in /components/.
+  3. The classic bundler serves its own HTML shell — <script> tags in
+     /public/index.html NEVER execute. Tailwind v4 (browser build) is
+     injected at runtime by /index.tsx instead. The system prompt tells the
+     model not to create tailwind.config.js and not to use @apply, because
+     neither would be processed.
+
+
+WHAT IS BUILT vs WHAT IS NOT
+--------------------------------------------------------------------------------
+Done (Slice 1 + hardening pass, 2026-09-02):
+  - Provider abstraction with six presets
+  - Streaming agent loop with 8 file tools, strict argument validation
+  - SSE protocol (LF and CRLF framing), live file writes into the preview
+  - History sanitizer: Stop/disconnect mid-round can no longer brick a session
+  - Sandpack preview (classic bundler) + read-only code editor + file tree
+  - Chat UI: streaming prose, in-flight tool rows, stop button, notices,
+    scroll that doesn't fight the user
+  - Loop guard, env-parsing guards, error surfacing, missing-key message
+
+HARDENING PASS: a 6-lens adversarial review (34 agents) produced 49 raw
+findings; every confirmed or self-verified defect was fixed, including:
+edit_file $-pattern corruption (String.replace GetSubstitution), CRLF SSE
+streams parsing to zero events, dangling tool_calls poisoning sessions,
+non-string tool args silently emptying files, finish_reason "length"
+misdiagnosis, env NaN/0 footguns, ghost template files, files-prop churn
+resetting the editor, and $-, path- and shape-validation on the API.
+
+Verified end-to-end:
+  - typecheck, lint, production build
+  - 10 protocol tests through the real route against a scenario mock:
+    CRLF streams, $-preservation, tool-result round-trips, non-string
+    rejection, sanitizer repair (cancelled=1), 400s on malformed requests,
+    path canonicalization
+  - real-browser journey (headless Chromium): workbench renders, Sandpack
+    boots (~3s), Tailwind styles apply, chat -> agent -> live preview update,
+    npm dependency added by the agent resolves in the running preview
+  - a complete real build against Gemini (counter app, 8 tool rounds)
+
+Not built yet:
+  Slice 2  Persistence — SQLite via Drizzle, project list, message history,
+           snapshots with restore. Snapshots matter more than they sound:
+           "undo back to when it worked" is the feature users lean on hardest.
+  Slice 3  The feel — auto-fix error loop (catch Sandpack compile and runtime
+           errors, feed them back, capped at ~2 attempts), better streaming
+           indicators, diff view.
+  Slice 4  Export — GitHub push via API, ZIP download.
+  Slice 5  The product layer — Postgres, auth, credits, hosted deploys.
+
+
+SWAPPING THE RUNTIME
+--------------------------------------------------------------------------------
+If Sandpack becomes limiting (real npm installs, a Node backend, routing at
+scale), the replacement is a cloud sandbox: E2B, Daytona or Fly Machines.
+
+Only PreviewPanel.tsx and the template need to change. The agent loop, the
+tools and the virtual FS are unaware of where code runs. Budget roughly
+$0.05-0.15/hr per running sandbox and plan idle hibernation before you switch.
+
+
+KNOWN LIMITS — ACCEPTED FOR SLICE 1
+--------------------------------------------------------------------------------
+  - History grows without bound: every read_file result stays in the
+    conversation and is re-POSTed with each message. This is the flip side of
+    the append-only, cache-friendly design. Reads of huge files are truncated
+    at 48k chars, but a long session still gets heavy. The fix (windowing /
+    summarization over persisted history) belongs to Slice 2.
+  - The code editor is read-only: hand edits could never reach the agent's
+    file map and the next generated write would silently revert them. A real
+    editing round-trip is future work.
+  - reactStrictMode is OFF (next.config.ts): StrictMode's dev double-mount
+    races sandpack-client's async bundler registration, leaving a dead client
+    whose preview silently ignores every update. Verified broken in dev /
+    working in prod with the identical build. Re-test before re-enabling.
+
+
+KNOWN LIMITS OF THE FREE-TIER APPROACH
+--------------------------------------------------------------------------------
+  - Rate limits are per request, and one user message costs 10-20 requests.
+    Daily free quotas disappear faster than you would expect.
+  - Free tiers generally permit training on your data. Fine while building;
+    not fine once you have users.
+  - Generation quality is the product. Free-tier models are noticeably weaker
+    at multi-file agentic code generation than frontier models. Expect that to
+    be the bottleneck, and expect to move to a paid provider before launch.
+    The provider abstraction exists precisely so that is a one-line change.
+
+
+ENV REFERENCE
+--------------------------------------------------------------------------------
+  AI_PROVIDER            gemini | groq | openrouter | cerebras | mistral | openai
+  AI_API_KEY             required
+  AI_MODEL               override the preset default (gemini-3.6-flash = better
+                         quality but ~20 free requests/day)
+  AI_BASE_URL            for a provider not in the preset table
+  AI_MAX_TOKENS          default 8192
+  AI_TEMPERATURE         default 0.2
+  AI_MAX_RETRIES         attempts per request on 429/5xx, default 8
+  AGENT_MAX_ITERATIONS   default 25
